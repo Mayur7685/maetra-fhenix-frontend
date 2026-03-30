@@ -1,170 +1,519 @@
-# Maetra — Prove Your Edge. Privately.
+# Maetra
 
-**Live**: https://maetra.vercel.app | **API**: https://maetra-api.onrender.com
+**Privacy-preserving trading reputation and alpha-sharing platform built on Fhenix / Arbitrum Sepolia.**
+
+Traders prove their performance without revealing raw trade data. Subscribers pay in USDC to access encrypted alpha posts. All sensitive data — trade metrics, subscription status, post content — is encrypted end-to-end. Nothing leaks.
 
 ---
 
-## What it does
+## How It Works
 
-Maetra is a privacy-first trading reputation platform built on the Aleo blockchain. It lets crypto traders prove their performance through zero-knowledge proofs and monetize their insights — without ever revealing their wallets, positions, or trade history.
-
-**For Traders (Creators):**
-- Connect an exchange (Hyperliquid, Binance) or use demo data
-- Generate a ZK proof of trading performance — raw metrics stay private, only the trust score, win rate, and weight class go public
-- Set a subscription price in Aleo credits
-- Publish alpha content (trade calls, analysis) — content hash timestamped on-chain so no one can fake hindsight
-
-**For Followers (Subscribers):**
-- Browse a leaderboard of ZK-verified traders ranked by trust score
-- Subscribe to unlock a creator's alpha content — payment and subscription are private on-chain
-- Verify that a creator actually published a call before the market moved, using the immutable on-chain content hash
-
-**The full loop:**
 ```
-Exchange data (private) → ZK proof → Public trust score on leaderboard
-                                           ↓
-                         Subscriber pays Aleo credits → Private SubscriptionRecord
-                                           ↓
-                         Alpha content unlocked → Content hash verifiable on-chain
+Trader connects exchange (Hyperliquid / Binance)
+  → Backend syncs trade history, computes performance metrics
+  → Frontend encrypts metrics client-side using CoFHE SDK
+  → MaetraTrust.submitPerformance() stores encrypted euint32 values on-chain
+  → Contract computes winRate + trustScore homomorphically (fully on-chain, never decrypted)
+  → Trader calls optIntoLeaderboard() → FHE async decryption publishes score publicly
+  → Trader sets subscription price → MaetraSubscription.setPrice()
+  → Trader creates alpha posts → content AES-256-GCM encrypted in browser → hash timestamped on-chain
+
+Subscriber finds creator on leaderboard
+  → Approves USDC → MaetraSubscription.subscribe() → price paid to creator, encrypted ebool stored
+  → Backend registers subscription → creator's ECDH-wrapped CEK granted to subscriber's public key
+  → Subscriber decrypts posts locally using their ECDH private key
 ```
 
 ---
 
-## The problem it solves
+## Repository Layout
 
-Crypto trading "alpha" is broken. The current ecosystem runs on:
-
-1. **Unverified claims** — Traders post PnL screenshots that are trivially faked. There's no way to verify performance without doxxing your entire wallet.
-
-2. **No privacy for traders** — If a profitable trader shares their wallet publicly for proof, they get frontrun, copied, and targeted. Privacy and proof are treated as mutually exclusive.
-
-3. **No privacy for subscribers** — On public blockchains, everyone can see who subscribes to whom. This leaks trading strategy interests and financial relationships.
-
-4. **No timestamped proof of alpha** — A creator can claim they called a trade after the fact. There's no immutable record of when a call was published.
-
-5. **Centralized trust** — Existing platforms (like Tickr on Nillion) rely on third-party MPC networks to verify data. You're trusting their infrastructure, not math.
-
-**Maetra solves all five:**
-
-| Problem | Maetra's Solution |
-|---------|------------------|
-| Unverified claims | ZK proofs — mathematically guaranteed correct scores |
-| Trader privacy | Private inputs — raw trades never leave the wallet |
-| Subscriber privacy | Aleo private records — nobody sees who subscribes to whom |
-| Fake hindsight | Content hashes on-chain — immutable timestamp proof |
-| Centralized trust | Aleo L1 — fully decentralized, verifiable by anyone |
+```
+fhenix-thon/
+  maetra-contracts/        Solidity contracts (Hardhat + CoFHE)
+  maetra-backend/          Node.js / Express API server
+  maetra-frontend/         Vite + React frontend
+  maetra-leo-programs/     Legacy Aleo programs (archived, superseded)
+  cofhesdk/                Local CoFHE SDK source (pinned beta)
+  selective-disclosure-demo/  CoFHE WASM reference app
+```
 
 ---
 
-## Challenges I ran into
+## Smart Contracts
 
-**Prisma 7 + ESM + Aleo on production:**
-Prisma 7's new `prisma-client` generator outputs TypeScript files with extensionless imports (`import from "./internal/class"`). This works locally but breaks on Render's strict Node.js ESM resolution. We solved it by using `tsx` as the production runtime instead of compiling with `tsc` — tsx handles TypeScript natively and resolves Prisma's imports correctly.
+Deployed on **Arbitrum Sepolia** via `@cofhe/hardhat-plugin`. Solidity `^0.8.25`, EVM target `cancun`.
 
-**Aleo wallet adapter compatibility with React 19:**
-The `@provablehq` wallet packages declare React 18 as a peer dependency. We need `--legacy-peer-deps` for every install. Beyond that, the `DecryptPermission` import differs between `@provablehq/aleo-wallet-standard` and `@provablehq/aleo-wallet-adaptor-core` — we had to trace through the NullPay and alpaca-invoice reference projects to find that the core version is what `WalletProvider` actually expects.
+### MaetraTrust
 
-**Shield wallet transaction polling:**
-Shield wallet's `transactionStatus()` returns inconsistent formats — sometimes a plain string, sometimes an `{status, transactionId}` object. We had to type the response as `unknown` and handle both formats. We also implemented direct adapter polling (1s intervals, 120 attempts) instead of relying on the hook, following patterns from NullPay's production code.
+Stores and computes on **encrypted trade performance metrics** using FHE.
 
-**ZK-compatible math in Leo:**
-Leo doesn't support floating-point arithmetic or standard library functions like `log()`. We implemented a piecewise linear approximation of log base 10 for the trust score formula, using integer math with fixed-point precision (multiply by 10000, divide at the end).
+**Storage (all encrypted):**
 
-**Content gating timing:**
-Initially, subscribing unlocked content immediately — before the on-chain transaction confirmed. A subscriber would see posts even if their transaction later failed. We fixed this by adding `waitForConfirmation()` that polls the transaction status until `accepted` before creating the database subscription record.
+| Mapping | Type | Description |
+|---------|------|-------------|
+| `trustScores[trader]` | `euint32` | Computed trust score |
+| `winRates[trader]` | `euint32` | Win rate in basis points (0–10 000) |
+| `tradeCounts[trader]` | `euint32` | Total number of trades |
+| `weightClasses[trader]` | `euint8` | 0 = Lightweight, 1 = Mid, 2 = Heavy |
+| `winStreaks[trader]` | `euint32` | Current win streak in days |
 
-**BigInt serialization:**
-PostgreSQL `BIGINT` columns (subscription prices) come through Prisma as JavaScript `BigInt`, which `JSON.stringify` can't handle. We added a global Hono middleware that intercepts JSON serialization and converts `BigInt` values to strings.
+**Public leaderboard (opt-in plaintext):**
+
+| Mapping | Type |
+|---------|------|
+| `publicTrustScore[trader]` | `uint32` |
+| `publicWinRate[trader]` | `uint32` |
+| `publicWeightClass[trader]` | `uint8` |
+
+**Functions:**
+
+| Function | Description |
+|----------|-------------|
+| `submitPerformance(profitDays, totalDays, tradeCount, avgVolume, streak)` | Accept 5 `InEuint32` ciphertexts, compute winRate and trustScore homomorphically |
+| `optIntoLeaderboard()` | Allow global access to encrypted scores, call `FHE.decrypt()` to start async decryption |
+| `publishLeaderboardEntry(trader)` | After TaskManager fulfills decryption, store plaintext values on-chain |
+
+**Score formulas (computed in FHE, never decrypted mid-flight):**
+
+```
+winRate    = (profitableDays × 10 000) / totalDays        // basis points
+trustScore = (winRate × tradeCount) / 10 000
+weightClass:
+  avgVolume > $500K/day → 2 (Heavyweight)
+  avgVolume > $100K/day → 1 (Middleweight)
+  else                  → 0 (Lightweight)
+```
 
 ---
 
-## How Aleo is Used
+### MaetraSubscription
 
-For a detailed breakdown of how Aleo powers Maetra's privacy architecture — including the three Leo programs, data flow diagrams, privacy boundaries, and what lives on-chain vs off-chain — see [how-aleo-used.md](./how-aleo-used.md).
+Stores **encrypted subscription state** per creator–subscriber pair.
+
+**Storage:**
+
+| Mapping | Type | Description |
+|---------|------|-------------|
+| `subscriptionPrices[creator]` | `uint256` | USDC price (6 decimals; 0 = free) |
+| `subscriberCounts[creator]` | `uint256` | Public social proof counter |
+| `subscriptionActive[creator][subscriber]` | `ebool` | Encrypted active flag |
+| `subscriptionExpiry[creator][subscriber]` | `euint64` | Encrypted Unix timestamp |
+
+**Functions:**
+
+| Function | Description |
+|----------|-------------|
+| `setPrice(price)` | Creator sets USDC subscription price |
+| `subscribe(creator)` | Transfers USDC, sets `ebool active = true` and 30-day expiry |
+| `unsubscribe(creator)` | Sets `ebool active = false`, decrements count |
+
+**Access grants:** `subscriptionActive` and `subscriptionExpiry` are `allow`-ed to the subscriber (can decrypt own status) and the creator (can verify access). Off-chain decryption via CoFHE SDK — no transaction needed to check status.
 
 ---
 
-## Technologies I used
+### MaetraContent
 
-### Blockchain
-- **Aleo** — L1 blockchain with native zero-knowledge proof support
-- **Leo** — Smart contract language that compiles to Aleo Instructions
-- **3 Leo programs**: `maetra_trust.aleo`, `maetra_subscription.aleo`, `maetra_content.aleo`
+Minimal content timestamping — **no FHE**. The encrypted blob lives in PostgreSQL; only its `keccak256` hash is published on-chain.
+
+| Function | Description |
+|----------|-------------|
+| `publishContent(contentHash)` | Stores hash + owner, emits `ContentPublished` event, returns `postId` |
+| `verifyContent(postId, hash)` | View: confirm stored hash matches a given hash |
+
+---
+
+## Privacy Model
+
+```
+Layer           What is encrypted / private
+──────────────────────────────────────────────────────────────────────────────
+FHE (on-chain)  Trade metrics: profitDays, totalDays, tradeCount, volume, streak
+                Derived scores: winRate, trustScore, weightClass (euint32/euint8)
+                Subscription status: active flag (ebool), expiry (euint64)
+
+E2E (client)    Post content: AES-256-GCM encrypted in browser, never leaves client
+                CEK distribution: ECDH P-256 key exchange; server stores only
+                  ciphertext, never the raw CEK
+
+Public          Trust scores (after opt-in leaderboard)
+                Subscription prices and subscriber counts
+                Content hashes (keccak256, timestamp proof only)
+                Username, display name, bio
+```
+
+---
+
+## Tech Stack
+
+### Contracts (`maetra-contracts/`)
+
+| Package | Version | Purpose |
+|---------|---------|---------|
+| Solidity | 0.8.25 | Smart contracts |
+| Hardhat | 2.x | Compile / deploy / test |
+| `@cofhe/hardhat-plugin` | beta | CoFHE mock node for local dev |
+| `@fhenixprotocol/cofhe-contracts` | beta | `FHE.sol`, `euint32`, `ebool`, `InEuint32` |
+| `@openzeppelin/contracts` | 5.x | `IERC20` |
+| hardhat-deploy | 0.12.x | Deterministic deploys with named accounts |
+
+### Backend (`maetra-backend/`)
+
+| Package | Purpose |
+|---------|---------|
+| Express | HTTP server |
+| Prisma + PostgreSQL | ORM and database |
+| JWT | Auth tokens |
+| viem | Receipt verification (on-chain tx confirmation) |
+| Hyperliquid / Binance SDK | Exchange data sync |
+
+### Frontend (`maetra-frontend/`)
+
+| Package | Version | Purpose |
+|---------|---------|---------|
+| React | 19.x | UI |
+| Vite | 6.x | Dev server + bundler |
+| vite-plugin-wasm | 3.x | Native WASM support for `tfhe` |
+| vite-plugin-top-level-await | 1.x | Required by CoFHE WASM init |
+| React Router | 7.x | Client-side routing |
+| wagmi | 2.15 | EVM wallet state |
+| RainbowKit | 2.2 | Wallet connect UI |
+| viem | 2.30 | Contract calls, tx signing |
+| `@cofhe/sdk` | `0.0.0-beta-20251103142716` | FHE input encryption + output decryption |
+| Tailwind CSS | 4.x | Dark theme styling |
+| TanStack Query | 5.x | Async state / cache |
+| Web Crypto API | built-in | ECDH key exchange, AES-256-GCM post encryption |
+
+---
+
+## Frontend Structure
+
+```
+maetra-frontend/src/
+  main.tsx                  React root mount
+  App.tsx                   BrowserRouter + all routes
+  index.css                 Tailwind v4 theme (dark mode CSS variables)
+  pages/
+    Landing.tsx             Public homepage — leaderboard preview, feature tabs
+    Login.tsx               Email/password login
+    Signup.tsx              Account registration
+    SetupProfile.tsx        First-time onboarding (username, bio, price)
+    Leaderboard.tsx         Ranked traders with trust scores and weight classes
+    MyPage.tsx              Creator dashboard — stats, exchange sync, posts, proof
+    MySubscriptions.tsx     Active subscriptions list + cancel
+    CreatorProfile.tsx      Public creator page — subscribe to unlock alpha
+  components/
+    Navbar.tsx              App navigation (react-router-dom Link)
+    Logo.tsx                Maetra logotype
+    LeaderboardPreview.tsx  Landing page leaderboard snippet
+    FeatureTabs.tsx         Landing page feature showcase
+  context/
+    AuthContext.tsx         JWT auth state, token storage, refreshUser
+    WalletContext.tsx       wagmi config, RainbowKit, chain setup
+    Providers.tsx           Wraps Auth + Wallet providers
+  hooks/
+    useMaetraContracts.ts   All on-chain interactions (see below)
+  lib/
+    api.ts                  Backend REST client + all TypeScript types
+    contracts.ts            Contract addresses, ABIs (from VITE_ env vars)
+    cofhe-client.ts         Lazy CoFHE SDK singleton (WASM init on first use)
+    crypto.ts               ECDH keypair gen, AES-GCM encrypt/decrypt, CEK wrapping
+```
+
+---
+
+## `useMaetraContracts` Hook
+
+Central hook for all on-chain operations. All writes include a **20% gas buffer** via `estimateFeesPerGas() × 120n / 100n` to avoid EIP-1559 base-fee races on Arbitrum Sepolia.
+
+| Function | Contract | What it does |
+|----------|----------|--------------|
+| `submitPerformance(inputs)` | MaetraTrust | Encrypts 5 `euint32` inputs via CoFHE SDK, submits tx, waits for receipt |
+| `optIntoLeaderboard()` | MaetraTrust | Calls `optIntoLeaderboard()`, waits for receipt |
+| `setSubscriptionPrice(priceUsdc)` | MaetraSubscription | Converts string USDC to wei, calls `setPrice()` |
+| `subscribe(creator, priceUsdc)` | MaetraSubscription + USDC | Checks/approves USDC allowance, then calls `subscribe()` |
+| `publishContent(contentBlob)` | MaetraContent | keccak256-hashes encrypted blob, calls `publishContent()` |
+| `decryptMyTrustScore()` | MaetraTrust (read) | Reads handle, CoFHE-decrypts trustScore + winRate + weightClass off-chain |
+| `checkMySubscription(creator)` | MaetraSubscription (read) | Reads `ebool` handle, CoFHE-decrypts subscription status off-chain |
+
+---
+
+## Backend Routes
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/api/auth/register` | — | Create account |
+| POST | `/api/auth/login` | — | Issue JWT |
+| GET | `/api/profile/me` | JWT | Get own profile |
+| PUT | `/api/profile/me` | JWT | Update profile / subscription price |
+| POST | `/api/profile/connect-wallet` | JWT | Link EVM address to account |
+| GET | `/api/leaderboard` | — | Get ranked trader list (`?period=30D`) |
+| GET | `/api/leaderboard/creator/:username` | — | Get single creator stats |
+| GET | `/api/exchanges` | JWT | List connected exchanges |
+| POST | `/api/exchanges/connect` | JWT | Add exchange API key |
+| DELETE | `/api/exchanges/:id` | JWT | Remove exchange |
+| POST | `/api/exchanges/sync` | JWT | Sync real trade history, store metrics |
+| POST | `/api/exchanges/mock-sync` | JWT | Generate demo metrics (no exchange required) |
+| GET | `/api/exchanges/proof-inputs` | JWT | Return cached metrics for FHE submission |
+| POST | `/api/posts` | JWT | Save encrypted post to DB |
+| GET | `/api/posts/creator/:username/posts` | JWT | List posts (locked if no subscription) |
+| GET | `/api/subscriptions` | JWT | List own subscriptions |
+| POST | `/api/subscriptions/subscribe/:creatorId` | JWT | Record subscription + tx hash |
+| DELETE | `/api/subscriptions/subscribe/:creatorId` | JWT | Cancel subscription |
+| POST | `/api/keys/store` | JWT | Store ECDH public key + encrypted private key backup |
+| GET | `/api/keys/my-keys` | JWT | Retrieve key backup |
+| POST | `/api/keys/content-key` | JWT | Creator stores self-wrapped CEK |
+| GET | `/api/keys/content-key` | JWT | Creator retrieves CEK backup |
+| GET | `/api/keys/pending-grants` | JWT | Creator gets subscribers needing CEK grant |
+| POST | `/api/keys/grant-bulk` | JWT | Creator grants encrypted CEK to multiple subscribers |
+| GET | `/api/keys/subscriber-key/:creatorId` | JWT | Subscriber retrieves their ECDH-wrapped CEK |
+
+---
+
+## User Flows
+
+### Creator
+
+```
+1. Sign up → Setup profile (username, bio)
+2. Connect exchange (Hyperliquid / Binance API key)  OR  use Demo Data
+3. Click "Sync & Prove":
+   a. Backend syncs exchange → returns metrics + leoInputs
+   b. Frontend encrypts 5 metrics using CoFHE SDK
+   c. Sends submitPerformance() tx → confirmed on-chain
+   d. Only after tx confirmed: backend proof-inputs refreshes leaderboard stats
+4. Click "Opt into Leaderboard" → optIntoLeaderboard() tx
+5. After TaskManager async decryption, publishLeaderboardEntry() can be called
+6. Set subscription offering (price + bio description)
+   a. setSubscriptionPrice() tx confirmed on-chain
+   b. Profile updated in DB
+7. Create alpha post:
+   a. Content AES-256-GCM encrypted in browser using CEK
+   b. keccak256(encryptedBlob) published on-chain via publishContent()
+   c. Encrypted blob stored in DB
+8. Auto-grant CEK to new subscribers (runs on page load):
+   - Fetches pending grants from backend
+   - ECDH-wraps CEK for each subscriber's public key
+   - Sends grant-bulk to backend
+```
+
+### Subscriber
+
+```
+1. Browse leaderboard → open creator profile
+2. Click "Unlock Alpha":
+   a. USDC allowance check → approve if needed
+   b. subscribe(creator) tx → USDC transferred to creator, ebool stored encrypted
+   c. Backend registers subscription + tx hash
+3. Creator's CEK auto-granted on next creator page load
+4. Posts decrypt in browser using subscriber's ECDH private key
+```
+
+---
+
+## Local Development
+
+### Prerequisites
+
+- Node.js 20+
+- PostgreSQL (for backend)
+- MetaMask or RainbowKit-compatible wallet
+
+### 1. Contracts
+
+```bash
+cd maetra-contracts
+npm install
+# Start local CoFHE node (includes mock FHE TaskManager)
+npx hardhat node
+# In a new terminal — deploy all three contracts
+npx hardhat deploy --network localhost
+```
+
+Deployed addresses are printed to console. Copy them to `maetra-frontend/.env`.
+
+### 2. Backend
+
+```bash
+cd maetra-backend
+npm install
+cp .env.example .env   # set DATABASE_URL, JWT_SECRET
+npx prisma migrate dev
+npm run dev            # starts on :3001
+```
+
+### 3. Frontend
+
+```bash
+cd maetra-frontend
+npm install
+cp .env.example .env
+# Edit .env:
+# VITE_TRUST_ADDRESS=<from step 1>
+# VITE_SUBSCRIPTION_ADDRESS=<from step 1>
+# VITE_CONTENT_ADDRESS=<from step 1>
+# VITE_WALLETCONNECT_PROJECT_ID=<from cloud.walletconnect.com>
+# VITE_BACKEND_URL=http://localhost:3001
+
+npm run dev            # starts on :3000
+```
+
+The Vite dev server proxies `/api/*` to the backend and serves the COOP/COEP headers required by `tfhe` (SharedArrayBuffer):
+
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: credentialless
+```
+
+### 4. Test with demo data
+
+No exchange API key needed. On My Page, click **"Generate Demo ZK Proof"** — calls `/api/exchanges/mock-sync` with realistic synthetic data, then runs the full on-chain proof flow.
+
+---
+
+## Environment Variables
+
+### `maetra-frontend/.env`
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `VITE_TRUST_ADDRESS` | Yes | Deployed MaetraTrust address |
+| `VITE_SUBSCRIPTION_ADDRESS` | Yes | Deployed MaetraSubscription address |
+| `VITE_CONTENT_ADDRESS` | Yes | Deployed MaetraContent address |
+| `VITE_WALLETCONNECT_PROJECT_ID` | Yes | From cloud.walletconnect.com |
+| `VITE_BACKEND_URL` | Prod only | Backend base URL (default: proxied by Vite) |
+| `VITE_RPC_URL` | Optional | Custom Arbitrum Sepolia RPC |
+
+### `maetra-backend/.env`
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DATABASE_URL` | Yes | PostgreSQL connection string |
+| `JWT_SECRET` | Yes | Token signing secret |
+| `PORT` | No | HTTP port (default 3001) |
+
+### `maetra-contracts/.env`
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DEPLOYER_PRIVATE_KEY` | Yes (prod) | Deployer wallet private key |
+| `ARBITRUM_SEPOLIA_RPC` | Yes (prod) | RPC endpoint |
+| `ARBISCAN_API_KEY` | Optional | Contract verification |
+
+---
+
+## Deployment
+
+### Contracts
+
+```bash
+cd maetra-contracts
+npx hardhat deploy --network arbitrumSepolia
+npx hardhat verify --network arbitrumSepolia <address>
+```
+
+### Frontend (Vite)
+
+```bash
+cd maetra-frontend
+npm run build        # outputs to dist/
+# deploy dist/ to any static host (Vercel, Cloudflare Pages, Netlify)
+```
+
+Static hosts need to forward COOP/COEP headers for `tfhe` WASM to work:
+
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: credentialless
+```
+
+**Vercel** — add to `vercel.json`:
+
+```json
+{
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "Cross-Origin-Opener-Policy",   "value": "same-origin" },
+        { "key": "Cross-Origin-Embedder-Policy", "value": "credentialless" }
+      ]
+    }
+  ]
+}
+```
+
+---
+
+## Content Encryption (E2E Detail)
+
+```
+Creator side:
+  generateKeyPair()            → ECDH P-256 keypair (stored in localStorage)
+  generateCEK()                → AES-256-GCM key (Content Encryption Key)
+  wrapCEKForSelf(cek, pub, priv)  → ECDH-derive shared secret, AES-wrap CEK
+  api.keys.storeContentKey()   → stores wrapped CEK on server (server sees only ciphertext)
+  aesEncrypt(cek, content)     → encrypt post body → store in DB
+
+  On new subscriber:
+  wrapCEKForSubscriber(cek, creatorPriv, subPub)  → ECDH-derived wrap for subscriber
+  api.keys.grantBulk()         → batch-store wrapped CEKs
+
+Subscriber side:
+  api.keys.subscriberKey()     → fetch creator's wrapped CEK + creator public key
+  unwrapCEKAsSubscriber(wrapped, subPriv, creatorPub) → recover CEK
+  aesDecrypt(cek, ciphertext)  → decrypt post body in browser
+```
+
+The server stores:
+- ECDH public keys (by design — needed for key exchange)
+- ECDH-wrapped CEKs (encrypted, server cannot recover plaintext)
+- AES-GCM ciphertext of posts (encrypted, server cannot read)
+
+The server never sees: raw trade metrics, CEKs, post plaintext, or private keys.
+
+---
+
+## Scripts Reference
+
+### Contracts
+
+| Command | Description |
+|---------|-------------|
+| `npx hardhat compile` | Compile contracts + generate TypeChain types |
+| `npx hardhat test` | Run unit tests |
+| `npx hardhat node` | Start local CoFHE + Hardhat node |
+| `npx hardhat deploy --network <net>` | Deploy all contracts |
+| `npx hardhat coverage` | Coverage report |
 
 ### Frontend
-- **Next.js 16** — React framework with App Router
-- **React 19** — UI library
-- **Tailwind CSS v4** — Styling (custom dark theme)
-- **@provablehq/aleo-wallet-adaptor** — Wallet connection (Shield, Leo, Fox, Puzzle, Soter)
+
+| Command | Description |
+|---------|-------------|
+| `npm run dev` | Vite dev server on :3000 with hot reload |
+| `npm run build` | TypeScript check + Vite production build |
+| `npm run preview` | Preview production build locally |
 
 ### Backend
-- **Hono** — Lightweight HTTP framework
-- **Prisma 7** — ORM with PostgreSQL adapter
-- **PostgreSQL** — Relational database
-- **tsx** — TypeScript runtime (dev + production)
-- **JWT + bcryptjs** — Authentication
 
-### Infrastructure
-- **Vercel** — Frontend hosting (https://maetra.vercel.app)
-- **Render** — Backend hosting + PostgreSQL (https://maetra-api.onrender.com)
+| Command | Description |
+|---------|-------------|
+| `npm run dev` | ts-node-dev with hot reload |
+| `npx prisma migrate dev` | Apply DB migrations |
+| `npx prisma studio` | Visual DB browser |
 
 ---
 
-## How we built it
+## Key Design Decisions
 
-### Phase 1: Foundation
-Set up the Next.js 16 frontend with React 19, Tailwind v4 dark theme, and Aleo wallet integration using `@provablehq` adapters. Built the Hono backend with Prisma 7, PostgreSQL, JWT auth, and wallet connection sync. Established the API proxy pattern where Next.js rewrites `/api/*` to the backend.
+**Why Fhenix / CoFHE instead of ZK proofs?**
+FHE allows the smart contract to compute on encrypted inputs directly — no circuit compilation, no trusted setup, no prover infrastructure. The entire `winRate` and `trustScore` calculation runs in Solidity on ciphertext. ZK would require off-chain proving and on-chain verification, adding latency and complexity.
 
-### Phase 2: Leo Smart Contracts
-Wrote three Leo programs in Leo:
+**Why is subscription status stored as FHE `ebool` instead of a plaintext flag?**
+Nobody — not the creator, the protocol, or a chain explorer — can determine who is subscribed to whom. Only the subscriber (and creator) can decrypt their own `subscriptionActive` handle. The subscriber count is public (social proof) but individual identities are hidden.
 
-- **`maetra_trust.aleo`** — Takes private trade metrics (profitable days, total days, trade count, volume, streak), computes win rate, trust score, and weight class inside a ZK circuit, then writes only the derived public scores to on-chain mappings. The trust score formula: `win_rate * log_approx(trade_count + 1) / 10000`.
+**Why is post content in PostgreSQL and not on-chain?**
+Content can be large and changes frequently. Storing AES-GCM ciphertext off-chain (DB) and only the `keccak256` hash on-chain gives tamper-proof timestamping without block gas costs or calldata bloat.
 
-- **`maetra_subscription.aleo`** — Creators set a public price. Subscribers call `subscribe()` which mints a private `SubscriptionRecord` (encrypted, only the subscriber can decrypt). On-chain, only the creator's subscriber count increments — the subscriber's identity is hidden.
-
-- **`maetra_content.aleo`** — When a creator publishes a post, the content hash is registered on-chain with the creator's address. This creates an immutable timestamp proof that the content existed at that block height.
-
-### Phase 3: Leaderboard and Profiles
-Built the leaderboard page that reads cached performance data (mirrored from on-chain mappings). Created the creator profile page with stats, bio, and subscription pricing. Built the creator dashboard (My Page) with exchange connections, ZK proof generation, and post creation.
-
-### Phase 4: Subscriptions and Content Gating
-Wired the subscription flow end-to-end: subscriber clicks "Unlock Alpha" → wallet executes `maetra_subscription::subscribe` → polls for on-chain confirmation → backend creates DB subscription → content API returns decrypted posts. Added content gating logic that checks subscription status before serving post content.
-
-### Phase 5: On-chain Subscription Payments
-Deployed `maetra_subscription_v3.aleo` which uses `credits.aleo/transfer_public_as_signer` to transfer Aleo credits from subscriber to creator on-chain. The backend verifies the Aleo transaction via the explorer API before creating the DB subscription. Prices are stored in microcredits (1 Aleo credit = 1,000,000 microcredits) and converted to human-readable Aleo credits in the UI.
-
-### Phase 6: End-to-End Content Encryption
-Built a true E2E encryption layer where even the server cannot read gated content. Each creator has a Content Encryption Key (CEK) generated client-side using Web Crypto API (AES-256-GCM). Posts are encrypted in the browser before being sent to the server — the backend stores and serves only ciphertext. When a subscriber pays, the creator's client wraps the CEK using an ECDH shared secret (creator private key + subscriber public key) and stores the encrypted key on the server. Subscribers unwrap the CEK client-side to decrypt posts. Private keys are backed up to the server encrypted with PBKDF2 (600,000 iterations), so the server never has access to plaintext keys or content.
-
-### Phase 7: Testing and Deployment
-Added a mock-sync endpoint that generates realistic demo trading data so the full flow (trust score → leaderboard → subscription → content) can be tested without real exchange connections. Deployed the backend to Render and frontend to Vercel, solving the Prisma ESM resolution issue by switching to tsx as the production runtime.
-
----
-
-## What we learned
-
-**Aleo's privacy model is genuinely different from public blockchains.** Private inputs to a Leo transition are never visible to anyone — not even validators. The ZK proof guarantees correctness without revealing the underlying data. This isn't just "encrypted data" — it's mathematically impossible to extract the private inputs from the proof.
-
-**Private records are Aleo's killer feature for subscriptions.** On Ethereum, if you subscribe to someone, that relationship is permanently public on-chain. On Aleo, the `SubscriptionRecord` is encrypted and only the owner can decrypt it. The on-chain state only shows aggregate counts, not individual relationships.
-
-**Leo's constraints force simpler, more correct code.** No floating point means you think harder about precision. No dynamic arrays means you design for fixed-size inputs. No external calls within transitions means clear separation of concerns. These constraints actually led to cleaner architecture.
-
-**ZK proof generation is slow but the UX can hide it.** Generating a ZK proof takes time (wallet-dependent, 10-60 seconds). We built the UI to show clear status progression: "Signing transaction..." → "Confirming on Aleo..." → "Done". The user stays informed without needing to understand the underlying cryptography.
-
-**The hybrid on-chain/off-chain architecture is the right pattern.** Storing full post content on-chain would be expensive and slow. Instead, only the content hash goes on-chain (for timestamp proof), while the actual content lives in PostgreSQL (for fast delivery). The database is a cache/access-control layer; the blockchain is the source of truth for reputation.
-
----
-
-## What's next for Maetra
-
-**Exchange API integration** — Connect to real Hyperliquid and Binance APIs to fetch actual trade data. The mock-sync endpoint proves the pipeline works; replacing it with real exchange adapters is a straightforward swap.
-
-**Prediction market alpha (Polymarket)** — Expand beyond perpetuals trading to prediction markets. Creators can prove their Polymarket track record via ZK proofs — win rate on event contracts, ROI across markets, streak of correct predictions — and monetize prediction alpha through the same subscription model.
-
-**Aleo mainnet deployment** — Deploy the three Leo programs (`maetra_trust`, `maetra_subscription_v3`, `maetra_content`) to Aleo mainnet. Currently deployed on testnet; mainnet requires funded accounts and a production deployment pipeline.
-
-**Multi-period leaderboards** — Support 24H, 7D, 30D, and All Time periods with separate on-chain proof submissions per period, so traders can showcase consistency across timeframes.
-
-**Mobile-responsive design** — The current UI works on desktop. Tailwind responsive classes are partially in place; a full mobile pass is needed for the leaderboard table, modals, and wallet connection flow.
-
-**Security audit** — The Leo programs need a formal audit before mainnet deployment. Key areas: input validation bounds, integer overflow in trust score calculation, and subscription expiry enforcement.
+**Why Vite instead of Next.js?**
+The `tfhe` WASM module (3.3 MB) requires `SharedArrayBuffer` (COOP/COEP headers) and needs to be excluded from the JS bundler entirely. Vite's `vite-plugin-wasm` handles this natively. Turbopack (Next.js) did not support the CoFHE WASM bundle reliably at the time of build.
