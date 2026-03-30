@@ -150,7 +150,7 @@ export function useMaetraContracts() {
     setError(null);
     try {
       const gas = await getGasOverrides();
-      const hash = await trust.write.optIntoLeaderboard([], gas);
+      const hash = await trust.write.optIntoLeaderboard(gas);
       setLastTxHash(hash);
       await publicClient!.waitForTransactionReceipt({ hash });
       return hash;
